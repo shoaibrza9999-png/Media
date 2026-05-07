@@ -94,8 +94,7 @@ class Leader(threading.Thread):
         super().__init__()
         self.inbox = leader_queue
         self.worker_queues = worker_queues
-        self.best_bot_code = BASE_BOT
-        self.best_bot_author = "Base"
+        self.all_winning_bots = [BASE_BOT]
         self.daemon = True
 
     def run(self):
@@ -105,22 +104,29 @@ class Leader(threading.Thread):
                 msg = self.inbox.get(timeout=1)
 
                 if msg.msg_type == 'SUBMIT':
-                    print(f"[Leader] Evaluating new bot from {msg.sender_name}...")
-                    success, details = evaluate_bot(msg.payload, self.best_bot_code)
+                    print(f"[Leader] Evaluating new bot from {msg.sender_name} against {len(self.all_winning_bots)} previous bots...")
 
-                    if success:
-                        print(f"[Leader] ACCEPTED! {msg.sender_name}'s bot is the new best! {details}")
-                        self.best_bot_code = msg.payload
-                        self.best_bot_author = msg.sender_name
+                    all_success = True
+                    details_log = ""
+                    for idx, old_bot in enumerate(self.all_winning_bots):
+                        success, details = evaluate_bot(msg.payload, old_bot, num_matches=2)
+                        details_log += f"Vs Bot {idx}: {details}\n"
+                        if not success:
+                            all_success = False
+                            break
+
+                    if all_success:
+                        print(f"[Leader] ACCEPTED! {msg.sender_name}'s bot beat all previous {len(self.all_winning_bots)} bots!")
+                        self.all_winning_bots.append(msg.payload)
                         # Broadcast success
                         for q in self.worker_queues:
-                            q.put(Message(-1, "Leader", "ANNOUNCE", f"New best bot by {msg.sender_name}! Details: {details}\nHere is the code to improve upon:\n```python\n{self.best_bot_code}\n```"))
+                            q.put(Message(-1, "Leader", "ANNOUNCE", f"New best bot by {msg.sender_name}! Details:\n{details_log}\nHere is the code to improve upon:\n```python\n{msg.payload}\n```"))
                         # Also save to disk
                         with open(f"best_bot_{msg.sender_name}_{int(time.time())}.py", "w") as f:
-                            f.write(self.best_bot_code)
+                            f.write(msg.payload)
                     else:
-                        print(f"[Leader] REJECTED {msg.sender_name}'s bot. {details}")
-                        self.worker_queues[msg.sender_id].put(Message(-1, "Leader", "FEEDBACK", f"Bot evaluation failed: {details}"))
+                        print(f"[Leader] REJECTED {msg.sender_name}'s bot. It failed against one of the previous bots.")
+                        self.worker_queues[msg.sender_id].put(Message(-1, "Leader", "FEEDBACK", f"Bot evaluation failed:\n{details_log}"))
 
                 elif msg.msg_type == 'CHAT':
                     print(f"[Leader] Forwarding chat from {msg.sender_name}")
