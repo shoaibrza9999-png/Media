@@ -1,4 +1,4 @@
 gradio
 kaggle-environments
-litellm
+requests
 huggingface_hub

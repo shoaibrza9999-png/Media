@@ -3,20 +3,13 @@ import time
 import queue
 import threading
 import tempfile
-import re
 import traceback
 import sys
+import requests
+import json
 from kaggle_environments import make
-import litellm
 
-# Set API key and model for Jules/Pollinations API
-MODEL_NAME = os.getenv("LLM_MODEL", "openai/openai")
-litellm.api_base = "https://gen.pollinations.ai"
-
-if not os.getenv("OPENAI_API_KEY"):
-    print("Warning: OPENAI_API_KEY environment variable is not set. Ensure the Jules API key is set to make API calls.")
-
-print(f"Using Jules/Pollinations API model: {MODEL_NAME}")
+JULES_API_KEY = os.getenv("JULES_API_KEY")
 
 BASE_BOT = """
 def agent(obs, conf):
@@ -28,14 +21,10 @@ class Message:
     def __init__(self, sender_id, sender_name, msg_type, payload):
         self.sender_id = sender_id
         self.sender_name = sender_name
-        self.msg_type = msg_type  # 'SUBMIT', 'CHAT', 'ANNOUNCE', 'FEEDBACK'
+        self.msg_type = msg_type
         self.payload = payload
 
 def evaluate_bot(new_code, best_code, num_matches=3):
-    """
-    Evaluates new_code against best_code for a given number of matches.
-    Returns (success_boolean, details_string).
-    """
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f_new, \
          tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f_best:
         f_new.write(new_code)
@@ -43,56 +32,38 @@ def evaluate_bot(new_code, best_code, num_matches=3):
         f_new_name = f_new.name
         f_best_name = f_best.name
 
-    env = make("orbit_wars", configuration={"episodeSteps": 100}) # Shorter steps for faster evaluation
-
-    wins = 0
-    crashes = 0
-    details = ""
+    env = make("orbit_wars", configuration={"episodeSteps": 100})
+    wins, crashes, details = 0, 0, ""
 
     try:
         for i in range(num_matches):
-            # Play as player 1
             out = env.run([f_new_name, f_best_name])
             if len(out) == 0:
-                crashes += 1
-                details += f"Match {i}: Environment returned no steps. "
+                crashes += 1; details += f"Match {i}: No steps. "
                 continue
 
             p1_status = out[-1][0]['status']
             r1 = out[-1][0]['reward'] or 0
             r2 = out[-1][1]['reward'] or 0
+            if p1_status == 'ERROR': crashes += 1; details += f"Match {i}: Bot crashed. "
+            elif r1 > r2: wins += 1
 
-            if p1_status == 'ERROR':
-                crashes += 1
-                details += f"Match {i}: Bot crashed. "
-            elif r1 > r2:
-                wins += 1
-
-            # Play as player 2
             out2 = env.run([f_best_name, f_new_name])
             p2_status = out2[-1][1]['status']
             r1_2 = out2[-1][0]['reward'] or 0
             r2_2 = out2[-1][1]['reward'] or 0
-
-            if p2_status == 'ERROR':
-                crashes += 1
-                details += f"Match {i} (p2): Bot crashed. "
-            elif r2_2 > r1_2:
-                wins += 1
+            if p2_status == 'ERROR': crashes += 1; details += f"Match {i} (p2): Bot crashed. "
+            elif r2_2 > r1_2: wins += 1
     except Exception as e:
-        crashes += 1
-        details += f"Exception during eval: {e}\n{traceback.format_exc()}"
+        crashes += 1; details += f"Exception: {e}\\n{traceback.format_exc()}"
 
     os.remove(f_new_name)
     os.remove(f_best_name)
 
     total_games = num_matches * 2
-    if crashes > 0:
-        return False, f"Crashed or errored {crashes} times: {details}"
-    if wins > total_games / 2:
-        return True, f"Won {wins}/{total_games} matches!"
-    return False, f"Won {wins}/{total_games} matches, not enough to beat current best."
-
+    if crashes > 0: return False, f"Crashed {crashes} times: {details}"
+    if wins > total_games / 2: return True, f"Won {wins}/{total_games} matches!"
+    return False, f"Won {wins}/{total_games} matches, not enough to beat previous."
 
 class Leader(threading.Thread):
     def __init__(self, leader_queue, worker_queues):
@@ -103,14 +74,13 @@ class Leader(threading.Thread):
         self.daemon = True
 
     def run(self):
-        print("[Leader] Started and listening for submissions...")
+        print("[Leader] Started...")
         while True:
             try:
                 msg = self.inbox.get(timeout=1)
 
                 if msg.msg_type == 'SUBMIT':
-                    print(f"[Leader] Evaluating new bot from {msg.sender_name} against {len(self.all_winning_bots)} previous bots...")
-
+                    print(f"[Leader] Evaluating bot from {msg.sender_name} against {len(self.all_winning_bots)} previous bots...")
                     all_success = True
                     details_log = ""
                     for idx, old_bot in enumerate(self.all_winning_bots):
@@ -123,27 +93,19 @@ class Leader(threading.Thread):
                     if all_success:
                         print(f"[Leader] ACCEPTED! {msg.sender_name}'s bot beat all previous {len(self.all_winning_bots)} bots!")
                         self.all_winning_bots.append(msg.payload)
-                        # Broadcast success
                         for q in self.worker_queues:
-                            q.put(Message(-1, "Leader", "ANNOUNCE", f"New best bot by {msg.sender_name}! Details:\n{details_log}\nHere is the code to improve upon:\n```python\n{msg.payload}\n```"))
-                        # Also save to disk
+                            q.put(Message(-1, "Leader", "ANNOUNCE", f"New best bot by {msg.sender_name}!\\n{details_log}"))
                         with open(f"best_bot_{msg.sender_name}_{int(time.time())}.py", "w") as f:
                             f.write(msg.payload)
                     else:
-                        print(f"[Leader] REJECTED {msg.sender_name}'s bot. It failed against one of the previous bots.")
-                        self.worker_queues[msg.sender_id].put(Message(-1, "Leader", "FEEDBACK", f"Bot evaluation failed:\n{details_log}"))
-
+                        self.worker_queues[msg.sender_id].put(Message(-1, "Leader", "FEEDBACK", f"Evaluation failed:\\n{details_log}"))
                 elif msg.msg_type == 'CHAT':
-                    print(f"[Leader] Forwarding chat from {msg.sender_name}")
                     for i, q in enumerate(self.worker_queues):
-                        if i != msg.sender_id:
-                            q.put(msg)
-
+                        if i != msg.sender_id: q.put(msg)
             except queue.Empty:
                 pass
 
-
-class Worker(threading.Thread):
+class JulesWorker(threading.Thread):
     def __init__(self, worker_id, name, inbox, leader_queue):
         super().__init__()
         self.worker_id = worker_id
@@ -151,59 +113,72 @@ class Worker(threading.Thread):
         self.inbox = inbox
         self.leader_queue = leader_queue
         self.daemon = True
-        self.messages_history = [
-            {"role": "system", "content": f"You are a vibe coding AI agent named {self.name} participating in the Kaggle 'orbit_wars' competition. "
-                                          "Your goal is to write a Python bot that wins. "
-                                          "You must return Python code enclosed in ```python ... ``` blocks. "
-                                          "The environment expects a function `def agent(obs, conf):` which returns a list of moves `[[x, y, power]]`. "
-                                          "If you want to just chat with other agents, do not include code blocks. "
-                                          "The leader will automatically evaluate any code block you send. "
-                                          "Start with simple strategies and improve them based on feedback."}
-        ]
+        self.session_id = None
+        self.headers = {"X-Goog-Api-Key": JULES_API_KEY, "Content-Type": "application/json"}
+        self.last_activity_count = 0
+
+    def get_source(self):
+        resp = requests.get('https://jules.googleapis.com/v1alpha/sources', headers=self.headers)
+        if resp.status_code == 200 and resp.json().get('sources'):
+            return resp.json()['sources'][0]['name']
+        return "sources/github/example/repo" # Fallback
+
+    def create_session(self):
+        source = self.get_source()
+        payload = {
+            "prompt": f"You are {self.name}. Write a python bot for the Kaggle 'orbit_wars' competition. Ensure it has `def agent(obs, conf):` and returns `[[x, y, power]]`.",
+            "sourceContext": {"source": source},
+            "title": f"Orbit Wars Bot - {self.name}"
+        }
+        resp = requests.post('https://jules.googleapis.com/v1alpha/sessions', headers=self.headers, json=payload)
+        if resp.status_code == 200:
+            self.session_id = resp.json().get("name").split("/")[-1]
+            print(f"[{self.name}] Created Jules session: {self.session_id}")
+        else:
+            print(f"[{self.name}] Failed to create session: {resp.text}")
+
+    def send_message(self, message):
+        if not self.session_id: return
+        payload = {"prompt": message}
+        requests.post(f'https://jules.googleapis.com/v1alpha/sessions/{self.session_id}:sendMessage', headers=self.headers, json=payload)
+
+    def check_activities(self):
+        if not self.session_id: return
+        resp = requests.get(f'https://jules.googleapis.com/v1alpha/sessions/{self.session_id}/activities', headers=self.headers)
+        if resp.status_code == 200:
+            activities = resp.json().get('activities', [])
+            if len(activities) > self.last_activity_count:
+                for act in activities[self.last_activity_count:]:
+                    # Search for code in agent progress
+                    if act.get("originator") == "agent" and act.get("progressUpdated"):
+                        desc = act["progressUpdated"].get("description", "")
+                        # Try to extract python code block from Jules activity
+                        code_matches = re.findall(r'```python(.*?)```', desc, re.DOTALL)
+                        if code_matches:
+                            code = code_matches[0].strip()
+                            self.leader_queue.put(Message(self.worker_id, self.name, "SUBMIT", code))
+                        elif "Message from" in desc:
+                            self.leader_queue.put(Message(self.worker_id, self.name, "CHAT", desc))
+                self.last_activity_count = len(activities)
 
     def run(self):
-        print(f"[{self.name}] Started.")
-        # Initial submission
-        self.messages_history.append({"role": "user", "content": "Please write an initial basic bot for orbit_wars. Make sure it has the `def agent(obs, conf):` signature and returns a list of moves like `[[1, 0, 0]]` or similar."})
+        print(f"[{self.name}] Starting...")
+        if not JULES_API_KEY:
+            print(f"[{self.name}] JULES_API_KEY missing. Cannot use Jules API.")
+            return
+
+        self.create_session()
 
         while True:
-            # Check inbox
             while not self.inbox.empty():
                 msg = self.inbox.get()
                 if msg.msg_type in ['ANNOUNCE', 'FEEDBACK', 'CHAT']:
-                    self.messages_history.append({"role": "user", "content": f"Message from {msg.sender_name}: {msg.payload}"})
+                    self.send_message(f"Update: {msg.payload}")
 
-            try:
-                # Keep history size manageable to avoid context window limit
-                if len(self.messages_history) > 20:
-                    # Keep system prompt (index 0) and last 10 messages
-                    self.messages_history = [self.messages_history[0]] + self.messages_history[-10:]
+            self.check_activities()
+            time.sleep(10)
 
-                # Call LLM
-                response = litellm.completion(model=MODEL_NAME, messages=self.messages_history)
-                reply = response.choices[0].message.content
-                self.messages_history.append({"role": "assistant", "content": reply})
-
-                # Extract code if present
-                code_matches = re.findall(r'```python\n(.*?)```', reply, re.DOTALL)
-                if not code_matches:
-                    code_matches = re.findall(r'```(.*?)```', reply, re.DOTALL)
-
-                if code_matches:
-                    code = code_matches[0].strip()
-                    print(f"[{self.name}] Submitted a new bot.")
-                    self.leader_queue.put(Message(self.worker_id, self.name, "SUBMIT", code))
-                else:
-                    print(f"[{self.name}] Sent a chat message.")
-                    self.leader_queue.put(Message(self.worker_id, self.name, "CHAT", reply))
-
-            except Exception as e:
-                print(f"[{self.name}] LLM Error: {e}")
-
-            # Wait a bit before next action to avoid API spam
-            time.sleep(20)
-
-if __name__ == "__main__":
+def start_agents():
     num_workers = 3
     leader_queue = queue.Queue()
     worker_queues = [queue.Queue() for _ in range(num_workers)]
@@ -211,14 +186,11 @@ if __name__ == "__main__":
     leader = Leader(leader_queue, worker_queues)
     leader.start()
 
-    workers = []
     for i in range(num_workers):
-        w = Worker(i, f"Agent-{i+1}", worker_queues[i], leader_queue)
-        workers.append(w)
-        w.start()
+        JulesWorker(i, f"Agent-{i+1}", worker_queues[i], leader_queue).start()
 
+if __name__ == "__main__":
+    start_agents()
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Exiting...")
+        while True: time.sleep(1)
+    except KeyboardInterrupt: pass
