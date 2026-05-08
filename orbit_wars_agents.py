@@ -127,7 +127,7 @@ class JulesWorker(threading.Thread):
     def create_session(self):
         source_name, branch = self.get_source()
         payload = {
-            "prompt": f"You are {self.name}. Write a python bot for the Kaggle 'orbit_wars' competition. Ensure it has `def agent(obs, conf):` and returns `[[x, y, power]]`.",
+            "prompt": f"You are {self.name}. Write a python bot for the Kaggle 'orbit_wars' competition. Ensure it has `def agent(obs, conf):` and returns `[[x, y, power]]`.\n\nCRITICAL: Do not just write the code to a file like submission.py. You MUST output the final code directly in your message or progress update wrapped in ```python ... ``` blocks so I can extract it.",
             "sourceContext": {
                 "source": source_name,
                 "githubRepoContext": {
@@ -155,9 +155,14 @@ class JulesWorker(threading.Thread):
             activities = resp.json().get('activities', [])
             if len(activities) > self.last_activity_count:
                 for act in activities[self.last_activity_count:]:
-                    # Search for code in agent progress
-                    if act.get("originator") == "agent" and act.get("progressUpdated"):
-                        desc = act["progressUpdated"].get("description", "")
+                    # Search for code in agent progress or standard messages
+                    desc = ""
+                    if act.get("progressUpdated"):
+                        desc += act["progressUpdated"].get("description", "")
+                    if act.get("chatMessage"):
+                        desc += "\n" + act["chatMessage"].get("content", "")
+
+                    if act.get("originator") == "agent" and desc:
                         # Try to extract python code block from Jules activity
                         code_matches = re.findall(r'```python(.*?)```', desc, re.DOTALL)
                         if code_matches:
