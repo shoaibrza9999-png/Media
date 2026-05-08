@@ -10,9 +10,9 @@ from kaggle_environments import make
 import litellm
 
 # Set API key and model through environment variables
-MODEL_NAME = os.getenv("LLM_MODEL", "openai")
+MODEL_NAME = os.getenv("LLM_MODEL", "custom_openai/openai")
 # Configure custom base URL for Pollinations API
-litellm.api_base = "https://gen.pollinations.ai"
+litellm.api_base = "https://gen.pollinations.ai/v1"
 # Optionally, if the user provides the specific key in the environment
 if not os.getenv("OPENAI_API_KEY"):
     # Fallback to the provided key for the session if none exists
