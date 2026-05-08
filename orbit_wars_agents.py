@@ -16,7 +16,7 @@ litellm.api_base = "https://gen.pollinations.ai"
 # Optionally, if the user provides the specific key in the environment
 if not os.getenv("OPENAI_API_KEY"):
     # Fallback to the provided key for the session if none exists
-    os.environ["OPENAI_API_KEY"] = "sk_Gj94QdkYxVN61aoZp7DGrRz6FJRBxNrW"
+    print("Warning: OPENAI_API_KEY environment variable is not set. API calls will likely fail.")
 
 print(f"Using model: {MODEL_NAME} with custom api_base")
 

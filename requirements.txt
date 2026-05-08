@@ -1,4 +1,4 @@
-gradio==4.36.1
+gradio
 kaggle-environments
 litellm
 huggingface_hub
