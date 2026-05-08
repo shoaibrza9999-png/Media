@@ -120,14 +120,20 @@ class JulesWorker(threading.Thread):
     def get_source(self):
         resp = requests.get('https://jules.googleapis.com/v1alpha/sources', headers=self.headers)
         if resp.status_code == 200 and resp.json().get('sources'):
-            return resp.json()['sources'][0]['name']
-        return "sources/github/example/repo" # Fallback
+            # Just take the first source available for the user's API key
+            return resp.json()['sources'][0]['name'], "main"
+        return "sources/github/shoaibrza9999-png/Orbital-war", "main"
 
     def create_session(self):
-        source = self.get_source()
+        source_name, branch = self.get_source()
         payload = {
             "prompt": f"You are {self.name}. Write a python bot for the Kaggle 'orbit_wars' competition. Ensure it has `def agent(obs, conf):` and returns `[[x, y, power]]`.",
-            "sourceContext": {"source": source},
+            "sourceContext": {
+                "source": source_name,
+                "githubRepoContext": {
+                    "startingBranch": branch
+                }
+            },
             "title": f"Orbit Wars Bot - {self.name}"
         }
         resp = requests.post('https://jules.googleapis.com/v1alpha/sessions', headers=self.headers, json=payload)
